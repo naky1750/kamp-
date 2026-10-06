@@ -1,0 +1,13 @@
+# Python & Environment
+.venv/
+__pycache__/
+*.pyc
+*.joblib
+
+# Datasets & Output CSVs (용량이 크거나 결과 파일인 경우 제외)
+*.pdf
+*.csv
+!normalization_parameters.json
+
+# Visualizations (선택적 포함 가능)
+# *.png
