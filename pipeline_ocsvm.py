@@ -1,12 +1,16 @@
 """
 프레스 기계 이상 탐지 통합 파이프라인 (Raw CSV → 특징 추출 → One-Class SVM 추론)
 ================================================================================
-사용 방법:
-1. 학습 및 추론:
-   python pipeline_ocsvm.py --train_csv press_data_normal.csv --test_csv outlier_data.csv
+입력 실행 명령어 예시:
 
-2. 추론 전용:
-   python pipeline_ocsvm.py --test_csv outlier_data.csv --model_path ocsvm_model.joblib
+[방식 1] 기본 실행 (현재 폴더의 press_data_normal.csv 로 학습하고 outlier_data.csv 진단):
+   python pipeline_ocsvm.py
+
+[방식 2] 원하는 파일 직접 진단:
+   python pipeline_ocsvm.py --test_csv "진단할_파일.csv"
+
+[방식 3] 학습과 진단을 함께 수행:
+   python pipeline_ocsvm.py --train_csv "정상데이터.csv" --test_csv "이상데이터.csv"
 """
 
 import os
@@ -18,7 +22,7 @@ import joblib
 from typing import Tuple, List, Dict
 
 # ============================================================================
-# 1. 특징 추출 설정 및 파라미터
+# 1. 정규화 파라미터 및 상수 설정
 # ============================================================================
 
 NORMALIZATION_PARAMS = {
@@ -38,11 +42,11 @@ LOWFREQ_THRESHOLD = 1.2 # 저주파 기준 (Hz)
 
 
 def extract_features_from_window(v0: np.ndarray, v1: np.ndarray, cur: np.ndarray) -> Tuple[float, float, float]:
-    """17개 샘플 윈도우에서 3개 핵심 특징(V0_p2p, V1_flow, I_fent) 추출"""
-    # 1) V0_p2p (진동0 Peak-to-Peak)
+    """17개 샘플 윈도우에서 3개 핵심 특징(V0_p2p, V1_flow, I_fent) 수식 계산"""
+    # 1) V0_p2p (진동0 Peak-to-Peak: 최대값 - 최소값)
     p2p = float(np.max(v0) - np.min(v0))
     
-    # 2) V1_flow (진동1 저주파 비율 0~1.2Hz)
+    # 2) V1_flow (진동1 저주파 비율: 0~1.2Hz FFT 에너지 비율)
     fft_v1 = np.abs(np.fft.rfft(v1)) ** 2
     sum_v1 = np.sum(fft_v1)
     if sum_v1 < 1e-10:
@@ -52,7 +56,7 @@ def extract_features_from_window(v0: np.ndarray, v1: np.ndarray, cur: np.ndarray
         freqs = np.fft.rfftfreq(len(v1), 1/FS)
         flow = float(np.sum(norm_v1[freqs < LOWFREQ_THRESHOLD]))
         
-    # 3) I_fent (전류 스펙트럼 엔트로피)
+    # 3) I_fent (전류 스펙트럼 엔트로피: FFT 파워 스펙트럼 Shannon Entropy)
     fft_i = np.abs(np.fft.rfft(cur)) ** 2
     sum_i = np.sum(fft_i)
     if sum_i < 1e-10:
@@ -66,11 +70,14 @@ def extract_features_from_window(v0: np.ndarray, v1: np.ndarray, cur: np.ndarray
 
 
 def raw_csv_to_features(csv_path: str) -> pd.DataFrame:
-    """Raw CSV 경로를 받아 Burst 분할 후 윈도우 슬라이딩 특징 데이터프레임으로 변환"""
+    """Raw CSV 경로를 받아 (1) Burst 분할 -> (2) 윈도우 슬라이딩 -> (3) 특징 추출 -> (4) Z-score 정규화 수행"""
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"입력 파일을 찾을 수 없습니다: {csv_path}")
+        
     df = pd.read_csv(csv_path)
     df['TimeStamp'] = pd.to_datetime(df['TimeStamp'])
     
-    # Burst 분할
+    # 시간 간격 500ms 초과 시 Burst 분할
     df['time_diff_ms'] = df['TimeStamp'].diff().dt.total_seconds() * 1000
     df['is_gap'] = df['time_diff_ms'] > GAP_THRESHOLD
     df['is_gap'] = df['is_gap'].fillna(False)
@@ -95,7 +102,7 @@ def raw_csv_to_features(csv_path: str) -> pd.DataFrame:
             
             p2p, flow, fent = extract_features_from_window(v0_w, v1_w, cur_w)
             
-            # Z-Score 정규화
+            # Z-Score 정규화 (정상 기준)
             p2p_norm = (p2p - NORMALIZATION_PARAMS['V0_p2p_mean']) / NORMALIZATION_PARAMS['V0_p2p_std']
             flow_norm = (flow - NORMALIZATION_PARAMS['V1_flow_mean']) / NORMALIZATION_PARAMS['V1_flow_std']
             fent_norm = (fent - NORMALIZATION_PARAMS['I_fent_mean']) / NORMALIZATION_PARAMS['I_fent_std']
@@ -127,8 +134,8 @@ class PressAnomalyPipeline:
         self.is_fitted = False
         
     def fit(self, train_raw_csv: str):
-        """정상 Raw CSV 데이터를 전처리하여 One-Class SVM 학습"""
-        print(f"🔄 [1/2] 학습 데이터 특징 변환 중: {train_raw_csv}")
+        """정상 Raw CSV 데이터를 전처리하여 One-Class SVM 모델 학습"""
+        print(f"🔄 [1/2] 정상 Raw 데이터 파이프라인 전처리 중: {train_raw_csv}")
         df_feat = raw_csv_to_features(train_raw_csv)
         X_train = df_feat[['V0_p2p', 'V1_flow', 'I_fent']].values
         
@@ -138,19 +145,19 @@ class PressAnomalyPipeline:
         print("✓ 학습 완료!")
         
     def predict_raw_csv(self, test_raw_csv: str, output_csv: str = None) -> pd.DataFrame:
-        """Raw CSV 데이터를 입력받아 전처리 및 이상 여부 판정"""
+        """임의의 Raw CSV (정상 또는 이상) 데이터를 입력받아 전처리 및 이상 판정 결과 반환"""
         if not self.is_fitted:
             raise ValueError("모델이 아직 학습되지 않았습니다. fit()을 실행하거나 저장된 모델을 로드하세요.")
             
-        print(f"\n🔍 [추론] Raw CSV 데이터 전처리 중: {test_raw_csv}")
+        print(f"\n🔍 [진단 시작] Raw CSV 전처리 및 이상 탐지 중: {test_raw_csv}")
         df_feat = raw_csv_to_features(test_raw_csv)
         X_test = df_feat[['V0_p2p', 'V1_flow', 'I_fent']].values
         
         # OCSVM 예측 (1: 정상, -1: 이상)
         preds_raw = self.model.predict(X_test)
-        scores = -self.model.decision_function(X_test)  # 클수록 이상일 확률 높음
+        scores = -self.model.decision_function(X_test)  # 높을수록 이상 위험도 높음
         
-        # 0: 정상, 1: 이상 변환
+        # 라벨링 변환 (0: 정상, 1: 이상)
         df_feat['anomaly_pred'] = np.where(preds_raw == -1, 1, 0)
         df_feat['anomaly_score'] = scores
         df_feat['status_label'] = np.where(preds_raw == -1, 'OUTLIER (이상)', 'NORMAL (정상)')
@@ -160,61 +167,63 @@ class PressAnomalyPipeline:
         normal_win = total_win - outlier_win
         outlier_ratio = (outlier_win / total_win) * 100 if total_win > 0 else 0
         
-        print("\n================================================================================")
-        print(f"📊 진단 분석 리포트: {os.path.basename(test_raw_csv)}")
-        print("================================================================================")
-        print(f"- 전체 윈도우 수: {total_win} 개")
+        print("=" * 80)
+        print(f"📊 진단 분석 최종 리포트: {os.path.basename(test_raw_csv)}")
+        print("=" * 80)
+        print(f"- 총 검사 윈도우 수: {total_win} 개 (약 {total_win * 0.4:.1f} 초 분량)")
         print(f"- 정상 판정 윈도우: {normal_win} 개 ({100-outlier_ratio:.1f}%)")
         print(f"- 이상 판정 윈도우: {outlier_win} 개 ({outlier_ratio:.1f}%)")
-        print("--------------------------------------------------------------------------------")
+        print("-" * 80)
         if outlier_win > 0:
-            print(f"⚠️ 경고: 입력된 설비 데이터에서 총 {outlier_win}개의 이상 윈도우가 감지되었습니다!")
+            print(f"⚠️ [경고] 해당 데이터에서 {outlier_win}개의 이상 공정 구간(윈도우)이 감지되었습니다!")
         else:
-            print("✅ 정상: 모든 공정 윈도우가 정상 범위 내에 존재합니다.")
-        print("================================================================================\n")
+            print("✅ [정상] 해당 데이터는 전 구간 정상 작동 신호로 판단되었습니다.")
+        print("=" * 80 + "\n")
         
         if output_csv:
             df_feat.to_csv(output_csv, index=False, encoding='utf-8-sig')
-            print(f"💾 진단 결과 CSV 저장 완료: {output_csv}")
+            print(f"💾 진단 결과 CSV 파일 저장 완료: {output_csv}")
             
         return df_feat
 
-    def save_model(self, filepath: str = "ocsvm_model.joblib"):
-        """학습된 모델 저장"""
+    def save_model(self, filepath: str = "ocsvm_pipeline.joblib"):
         joblib.dump(self, filepath)
-        print(f"💾 모델 저장 완료: {filepath}")
+        print(f"💾 모델 파일 저장 완료: {filepath}")
 
     @staticmethod
-    def load_model(filepath: str = "ocsvm_model.joblib"):
-        """저장된 모델 로드"""
+    def load_model(filepath: str = "ocsvm_pipeline.joblib"):
         pipeline = joblib.load(filepath)
         print(f"📂 모델 로드 완료: {filepath}")
         return pipeline
 
 
 # ============================================================================
-# 3. CLI 실행 메인 함수
+# 3. CLI 명령어 및 파라미터 입력 처리
 # ============================================================================
 
 if __name__ == "__main__":
-    import sys
+    parser = argparse.ArgumentParser(description="프레스 기계 이상 탐지 원스톱 파이프라인")
+    parser.add_argument("--train_csv", type=str, default="press_data_normal.csv", help="학습용 정상 Raw CSV 경로")
+    parser.add_argument("--test_csv", type=str, default="outlier_data.csv", help="진단할 대상 Raw CSV 경로")
+    parser.add_argument("--output_csv", type=str, default="diagnosis_result.csv", help="진단 결과 저장 CSV 경로")
+    parser.add_argument("--model_path", type=str, default="ocsvm_pipeline.joblib", help="저장/로드할 모델 파일 경로")
     
-    print("================================================================================")
-    print("프레스 기계 이상 탐지 통합 파이프라인 (One-Class SVM)")
-    print("================================================================================")
-    
-    # 기본 실행 예시 (학습: press_data_normal.csv, 추론: outlier_data.csv)
-    train_file = "press_data_normal.csv"
-    test_file = "outlier_data.csv"
+    args = parser.parse_args()
     
     pipeline = PressAnomalyPipeline(gamma=0.02, nu=0.0002)
     
     # 1. 학습
-    pipeline.fit(train_file)
-    pipeline.save_model("ocsvm_pipeline.joblib")
-    
-    # 2. 추론 (이상 데이터 테스트)
-    result_outlier = pipeline.predict_raw_csv(test_file, output_csv="outlier_diagnosis_result.csv")
-    
-    # 3. 추론 (정상 데이터 테스트)
-    result_normal = pipeline.predict_raw_csv(train_file, output_csv="normal_diagnosis_result.csv")
+    if os.path.exists(args.train_csv):
+        pipeline.fit(args.train_csv)
+        pipeline.save_model(args.model_path)
+    elif os.path.exists(args.model_path):
+        pipeline = PressAnomalyPipeline.load_model(args.model_path)
+    else:
+        print(f"[오류] 학습 파일({args.train_csv}) 또는 저장된 모델({args.model_path})이 존재하지 않습니다.")
+        exit(1)
+        
+    # 2. 추론
+    if os.path.exists(args.test_csv):
+        pipeline.predict_raw_csv(args.test_csv, output_csv=args.output_csv)
+    else:
+        print(f"[오류] 진단할 대상 파일이 존재하지 않습니다: {args.test_csv}")
